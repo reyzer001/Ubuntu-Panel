@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+.env*.local
+
+backend/.venv/
+backend/ubuntu-panel.db*
+backend/.env
+
+.run/
+__pycache__/
+*.pyc

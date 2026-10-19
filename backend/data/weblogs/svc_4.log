@@ -1,0 +1,24 @@
+
+> @porto/web@0.1.0 start
+> next start -p 3010
+
+   ▲ Next.js 15.5.24
+   - Local:        http://localhost:3010
+   - Network:      http://192.168.11.126:3010
+
+ ✓ Starting...
+ ✓ Ready in 538ms
+Killed
+npm error Lifecycle script `start` failed with error:
+npm error code 137
+npm error path /home/eta/Website/Porto_Vlssn3s/apps/web
+npm error workspace @porto/web@0.1.0
+npm error location /home/eta/Website/Porto_Vlssn3s/apps/web
+npm error command failed
+npm error command sh -c next start -p 3010
+   ▲ Next.js 15.5.24
+   - Local:        http://localhost:3010
+   - Network:      http://0.0.0.0:3010
+
+ ✓ Starting...
+ ✓ Ready in 960ms

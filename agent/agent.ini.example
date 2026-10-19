@@ -1,0 +1,4 @@
+[agent]
+server = http://192.168.11.126:8000
+token = pca_ganti-dengan-token-komputer
+interval = 10
