@@ -17,6 +17,7 @@ import {
 import { api } from "@/lib/api"
 import { formatBytes, formatRate, formatUptime, toneBarClass, usageTone } from "@/lib/format"
 import type { FilesystemInfo, Metrics, ProcessInfo, SystemInfo } from "@/lib/types"
+import { CoreGaugeGrid } from "@/components/ui/core-gauge-grid"
 
 export type MetricType = "cpu" | "memory" | "storage" | "load"
 
@@ -109,7 +110,9 @@ export function MetricDetailModal({
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
       <div
-        className="dialog-card max-w-[560px] p-6"
+        className={`dialog-card max-h-[90vh] overflow-y-auto p-6 ${
+          type === "cpu" ? "max-w-[900px]" : "max-w-[560px]"
+        }`}
         role="dialog"
         aria-modal="true"
         aria-label={hdr.title}
@@ -169,6 +172,8 @@ export function MetricDetailModal({
                   {systemInfo?.cpu_model || "Generic CPU"}
                 </div>
               </div>
+
+              <CoreGaugeGrid cores={metrics?.cpu_per_core} />
 
               {/* Top CPU consuming processes */}
               <div>

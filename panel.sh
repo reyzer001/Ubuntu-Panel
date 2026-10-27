@@ -134,7 +134,7 @@ in_container() {
 }
 
 find_stray_pids() {
-  local tracked="$1" pd pid cmd
+  local tracked="$1" only="${2:-}" pd pid cmd
   local found=()
   for pd in /proc/[0-9]*; do
     [[ -r "$pd/cmdline" ]] || continue
@@ -143,8 +143,11 @@ find_stray_pids() {
     in_container "$pid" && continue
     cmd="$(tr '\0' ' ' <"$pd/cmdline" 2>/dev/null || true)"
     case "$cmd" in
-      *uvicorn*app.main:app*) ;;
+      *uvicorn*app.main:app*)
+        [[ "$only" == "frontend" ]] && continue
+        ;;
       *"next-server"*|*"next dev"*)
+        [[ "$only" == "backend" ]] && continue
         # Abaikan next-server milik 9router
         local cwd
         cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
@@ -350,6 +353,20 @@ backend_code_changed() {
   [[ "$BACKEND/requirements.txt" -nt "$stamp" ]]
 }
 
+# true bila bundle .next lebih baru dari proses frontend yang sedang hidup.
+# Mencegah CSS/JS 400 setelah `npm run build` manual tanpa restart panel.
+frontend_bundle_newer_than_process() {
+  local pidfile="$1" pid started start_ts build_ts
+  [[ -f "$FRONTEND/.next/BUILD_ID" ]] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  started="$(ps -p "$pid" -o lstart= 2>/dev/null || true)"
+  [[ -n "$started" ]] || return 1
+  start_ts="$(date -d "$started" +%s 2>/dev/null || echo 0)"
+  build_ts="$(stat -c %Y "$FRONTEND/.next/BUILD_ID" 2>/dev/null || echo 0)"
+  (( build_ts > start_ts ))
+}
+
 # cegah stop terhadap proses milik user lain (butuh sudo) — gagalkan lebih awal
 ensure_owned_or_die() {
   local name="$1" pidfile="$2" owner
@@ -386,7 +403,7 @@ start_backend() {
   if am_root && [[ -n "${SUDO_USER:-}" ]]; then
     (
       cd "$BACKEND"
-      runuser -u "$TARGET_USER" -- bash -lc "cd '$BACKEND' && . .venv/bin/activate && setsid python -m uvicorn app.main:app --host 0.0.0.0 --port '$BACKEND_PORT' >>'$LOGS/backend.log' 2>&1" &
+      runuser -u "$TARGET_USER" -- bash -lc "export PATH='/usr/bin:/bin:\$PATH' FRONTEND_PORT='$FRONTEND_PORT' && cd '$BACKEND' && . .venv/bin/activate && setsid python -m uvicorn app.main:app --host 0.0.0.0 --port '$BACKEND_PORT' --timeout-graceful-shutdown 10 >>'$LOGS/backend.log' 2>&1" &
       echo $! > "$BACKEND_PID_FILE"
       echo "$BACKEND_PORT" > "$BACKEND_PORT_FILE"
       touch "$RUN/code.backend"
@@ -394,8 +411,8 @@ start_backend() {
   else
     (
       cd "$BACKEND"
-      setsid .venv/bin/python -m uvicorn app.main:app \
-        --host 0.0.0.0 --port "$BACKEND_PORT" \
+      setsid env FRONTEND_PORT="$FRONTEND_PORT" .venv/bin/python -m uvicorn app.main:app \
+        --host 0.0.0.0 --port "$BACKEND_PORT" --timeout-graceful-shutdown 10 \
         >>"$LOGS/backend.log" 2>&1 &
       echo $! > "$BACKEND_PID_FILE"
       echo "$BACKEND_PORT" > "$BACKEND_PORT_FILE"
@@ -407,7 +424,8 @@ start_backend() {
 start_frontend() {
   if alive "$FRONTEND_PID_FILE"; then
     if same_port "$FRONTEND_PORT_FILE" "$FRONTEND_PORT"; then
-      if [[ "$REBUILT" == "1" ]]; then
+      if [[ "$REBUILT" == "1" ]] ||
+         frontend_bundle_newer_than_process "$FRONTEND_PID_FILE"; then
         # bundle .next sudah diganti — proses lama masih memegang bundle
         # lama di memori, wajib di-restart agar memakai yang baru
         ensure_owned_or_die "frontend" "$FRONTEND_PID_FILE"
@@ -478,6 +496,15 @@ wait_ready() {
       return 1
     fi
     if curl -sf --max-time 3 -o /dev/null "$url"; then
+      # Simpan PID proses yang BENAR-BENAR memegang port. Saat start lewat
+      # runuser/setsid, $! bisa menunjuk wrapper, bukan uvicorn/next-server,
+      # sehingga stop berikutnya meninggalkan proses orphan.
+      if [[ "$skip" != "1" ]]; then
+        local real_pid
+        real_pid="$(ss -ltnpH "sport = :${url##*:}" 2>/dev/null \
+          | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+        [[ -n "$real_pid" ]] && printf '%s\n' "$real_pid" > "$pidfile" 2>/dev/null || true
+      fi
       printf ' \033[1;32mready\033[0m\n'
       return 0
     fi
@@ -489,8 +516,20 @@ wait_ready() {
   return 1
 }
 
+stop_panel_pid() {
+  local pid="$1" sig="$2" owner
+  owner="$(ps -p "$pid" -o user= 2>/dev/null | tr -d ' ')"
+  if [[ "$(id -u)" == "0" || "$owner" == "$(id -un)" ]]; then
+    kill "-${sig}" "$pid" 2>/dev/null || true
+  elif can_sudo; then
+    sudo -n kill "-${sig}" "$pid" 2>/dev/null ||
+      sudo -p "[sudo] password $(id -un): " kill "-${sig}" "$pid" 2>/dev/null || true
+  fi
+}
+
 stop_one() {
-  local name="$1" pidfile="$2" portfile="$3" pid i owner
+  local name="$1" pidfile="$2" portfile="$3" pid i owner port tracked strays stray stopped=0
+  port="$(cat "$portfile" 2>/dev/null || true)"
   if alive "$pidfile"; then
     pid="$(cat "$pidfile")"
     owner="$(owner_of "$pidfile")"
@@ -502,20 +541,47 @@ stop_one() {
       sleep 0.5
     done
     if alive "$pidfile"; then
-      kill -9 "$pid" 2>/dev/null || true
+      stop_panel_pid "$pid" 9
       sleep 0.5
     fi
     if alive "$pidfile"; then
       # JANGAN hapus pidfile — tracking harus tetap ada agar stop/status
       # berikutnya masih melihat proses ini.
       c_err "${name} (PID ${pid}) tidak bisa dihentikan — proses milik '${owner:-?}'."
-      c_err "  Jalankan: sudo ./panel.sh stop   atau: sudo fuser -k ${portfile:+$(cat "$portfile" 2>/dev/null)}/tcp"
+      c_err "  Jalankan: sudo ./panel.sh stop   atau: sudo fuser -k ${port:-?}/tcp"
       return 1
     fi
-    rm -f "$pidfile" "$portfile"
+    stopped=1
+  fi
+
+  # PID di pidfile bisa menunjuk wrapper runuser/setsid, atau proses aslinya
+  # sudah lepas menjadi orphan. Bersihkan sisa proses panel yang memegang port.
+  tracked="$(cat "$pidfile" 2>/dev/null || true)"
+  strays="$(find_stray_pids "$tracked" "$name" 2>/dev/null || true)"
+  for stray in $strays; do
+    owner="$(ps -p "$stray" -o user= 2>/dev/null | tr -d ' ')"
+    c_warn "${name}: proses panel tak tercatat (PID ${stray}${owner:+, user ${owner}}) — hentikan…"
+    stop_panel_pid "$stray" TERM
+    stopped=1
+  done
+  for i in $(seq 1 10); do
+    strays="$(find_stray_pids "$tracked" "$name" 2>/dev/null || true)"
+    [[ -z "$strays" ]] && break
+    sleep 0.5
+  done
+  for stray in $strays; do
+    stop_panel_pid "$stray" 9
+  done
+
+  if [[ -n "$port" ]] && port_open "$port"; then
+    c_err "${name}: port ${port} masih dipakai setelah proses dihentikan."
+    c_err "  Jalankan: sudo fuser -k ${port}/tcp"
+    return 1
+  fi
+  rm -f "$pidfile" "$portfile"
+  if (( stopped )); then
     c_ok "${name} dihentikan"
   else
-    rm -f "$pidfile" "$portfile"
     c_warn "${name} memang tidak sedang berjalan"
   fi
   return 0

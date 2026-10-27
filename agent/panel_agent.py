@@ -9,6 +9,8 @@ Linux/macOS), mengirim heartbeat berkala ke server panel berisi:
   - IP address tiap interface + MAC address
   - OS / versi agent
   - CPU & RAM usage (opsional, jika psutil tersedia)
+  - volume trafik jaringan (byte sejak heartbeat sebelumnya)
+  - speed test internet (PC → internet publik)
   - status internet (uji ICMP ke 1.1.1.1) + latency HTTP ke server
 
 Hanya butuh Python 3.8+ TANPA dependensi tambahan (psutil opsional).
@@ -73,12 +75,22 @@ import urllib.error
 import urllib.request
 import uuid
 
-AGENT_VERSION = "1.5.1"
+AGENT_VERSION = "1.6.0"
 SERVICE_NAME = "panel-agent"
 OFFICE_SERVER = "http://192.168.11.126:8000"
 DISCOVERY_PORT = 8001
 DISCOVERY_MAGIC = b"PANEL_DISCOVERY"
 DISCOVERY_RESPONSE_PREFIX = b"PANEL_SERVER|"
+
+# Speed test internet publik. Endpoint Cloudflare dipakai karena ringan dan
+# tidak butuh API key; ukuran diatur agar hasil tidak didominasi latency.
+SPEEDTEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+SPEEDTEST_UPLOAD_URL = "https://speed.cloudflare.com/__up"
+SPEEDTEST_DOWNLOAD_BYTES = 5_000_000
+SPEEDTEST_UPLOAD_BYTES = 2_000_000
+SPEEDTEST_TIMEOUT = 20
+SPEEDTEST_INTERVAL = 900
+SPEEDTEST_RETRY = 300
 
 # Alamat server yang ditanam OTOMATIS (tidak perlu diketik manual):
 #  - PANEL_SERVER_INJECTED diisi saat script diunduh dari panel
@@ -97,8 +109,16 @@ _last_latency: Optional[float] = None
 # kode HTTP heartbeat terakhir (401 → token invalid → auto re-register)
 _last_hb_status: Optional[int] = None
 _speed_lock = threading.Lock()
-_speed_result = {"download_mbps": None, "upload_mbps": None, "speed_test_at": ""}
+_speed_result = {
+    "download_mbps": None,
+    "upload_mbps": None,
+    "speed_test_at": "",
+    "speed_test_source": "",
+}
 _speed_started = False
+_speed_next_try = 0.0
+_net_lock = threading.Lock()
+_net_prev: Optional[Tuple[float, float, float]] = None
 _printer_cache: dict = {"at": 0.0, "data": []}
 
 
@@ -471,6 +491,203 @@ def check_internet() -> Optional[bool]:
         return None
 
 
+def _is_virtual_iface(name: str) -> bool:
+    lower = (name or "").strip().lower()
+    if not lower:
+        return True
+    if lower in ("lo", "lo0", "loopback"):
+        return True
+    return lower.startswith(
+        (
+            "docker",
+            "veth",
+            "virbr",
+            "br-",
+            "vmnet",
+            "vboxnet",
+            "vethernet",
+            "tap",
+            "tun",
+            "loopback",
+        )
+    )
+
+
+def _sum_counters(items, iface_name: str) -> Optional[Tuple[int, int]]:
+    """Jumlahkan byte RX/TX dari interface yang dipilih.
+
+    ``items`` = iterable (nama, bytes_recv, bytes_sent). Jika interface
+    aktif dikenali, hanya interface itu yang dihitung agar trafik WiFi/LAN
+    tidak dobel saat keduanya terpasang.
+    """
+    if iface_name:
+        matched = [
+            (rx, tx)
+            for name, rx, tx in items
+            if name.lower() == iface_name.lower()
+        ]
+        if matched:
+            return sum(rx for rx, _ in matched), sum(tx for _, tx in matched)
+    selected = [
+        (rx, tx)
+        for name, rx, tx in items
+        if not _is_virtual_iface(name)
+    ]
+    if not selected:
+        return None
+    return sum(rx for rx, _ in selected), sum(tx for _, tx in selected)
+
+
+def _win_net_counters(iface_name: str) -> Optional[Tuple[int, int]]:
+    """Fallback Windows tanpa psutil: GetIfTable2 (counter 64-bit)."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+
+        class MIB_IF_ROW2(ctypes.Structure):
+            _fields_ = [
+                ("InterfaceLuid", ctypes.c_uint64),
+                ("InterfaceIndex", ctypes.c_uint32),
+                ("InterfaceGuid", ctypes.c_ubyte * 16),
+                ("Alias", ctypes.c_wchar * 257),
+                ("Description", ctypes.c_wchar * 257),
+                ("PhysicalAddressLength", ctypes.c_uint32),
+                ("PhysicalAddress", ctypes.c_ubyte * 32),
+                ("PermanentPhysicalAddress", ctypes.c_ubyte * 32),
+                ("Mtu", ctypes.c_uint32),
+                ("Type", ctypes.c_uint32),
+                ("TunnelType", ctypes.c_uint32),
+                ("MediaType", ctypes.c_uint32),
+                ("PhysicalMediumType", ctypes.c_uint32),
+                ("AccessType", ctypes.c_uint32),
+                ("DirectionType", ctypes.c_uint32),
+                ("InterfaceAndOperStatusFlags", ctypes.c_ubyte * 4),
+                ("OperStatus", ctypes.c_uint32),
+                ("AdminStatus", ctypes.c_uint32),
+                ("MediaConnectState", ctypes.c_uint32),
+                ("NetworkGuid", ctypes.c_ubyte * 16),
+                ("ConnectionType", ctypes.c_uint32),
+                ("TransmitLinkSpeed", ctypes.c_uint64),
+                ("ReceiveLinkSpeed", ctypes.c_uint64),
+                ("InOctets", ctypes.c_uint64),
+                ("InUcastPkts", ctypes.c_uint64),
+                ("InNUcastPkts", ctypes.c_uint64),
+                ("InDiscards", ctypes.c_uint64),
+                ("InErrors", ctypes.c_uint64),
+                ("InUnknownProtos", ctypes.c_uint64),
+                ("InUcastOctets", ctypes.c_uint64),
+                ("InMulticastOctets", ctypes.c_uint64),
+                ("InBroadcastOctets", ctypes.c_uint64),
+                ("OutOctets", ctypes.c_uint64),
+                ("OutUcastPkts", ctypes.c_uint64),
+                ("OutNUcastPkts", ctypes.c_uint64),
+                ("OutDiscards", ctypes.c_uint64),
+                ("OutErrors", ctypes.c_uint64),
+                ("OutUcastOctets", ctypes.c_uint64),
+                ("OutMulticastOctets", ctypes.c_uint64),
+                ("OutBroadcastOctets", ctypes.c_uint64),
+                ("OutQLen", ctypes.c_uint64),
+            ]
+
+        class MIB_IF_TABLE2(ctypes.Structure):
+            _fields_ = [
+                ("NumEntries", ctypes.c_uint32),
+                ("Table", MIB_IF_ROW2 * 1),
+            ]
+
+        table = ctypes.POINTER(MIB_IF_TABLE2)()
+        if ctypes.windll.iphlpapi.GetIfTable2(ctypes.byref(table)) != 0:
+            return None
+        try:
+            rows = ctypes.cast(
+                table.contents.Table, ctypes.POINTER(MIB_IF_ROW2)
+            )
+            items = []
+            for index in range(int(table.contents.NumEntries)):
+                row = rows[index]
+                if row.Type == 24:  # IF_TYPE_SOFTWARE_LOOPBACK
+                    continue
+                items.append(
+                    (
+                        row.Alias or row.Description or "",
+                        int(row.InOctets),
+                        int(row.OutOctets),
+                    )
+                )
+        finally:
+            ctypes.windll.iphlpapi.FreeMibTable(table)
+        return _sum_counters(items, iface_name)
+    except Exception:
+        return None
+
+
+def _read_net_counters(iface_name: str = "") -> Optional[Tuple[int, int]]:
+    """Baca total byte RX/TX kumulatif dari interface jaringan."""
+    try:
+        import psutil  # type: ignore
+
+        items = [
+            (name, io.bytes_recv, io.bytes_sent)
+            for name, io in psutil.net_io_counters(pernic=True).items()
+        ]
+        return _sum_counters(items, iface_name)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    if platform.system() == "Linux":
+        try:
+            items = []
+            with open("/proc/net/dev", encoding="ascii") as handle:
+                for line in handle.readlines()[2:]:
+                    name, data = line.split(":", 1)
+                    parts = data.split()
+                    if len(parts) < 9:
+                        continue
+                    items.append(
+                        (name.strip(), int(parts[0]), int(parts[8]))
+                    )
+            return _sum_counters(items, iface_name)
+        except (OSError, ValueError):
+            return None
+
+    return _win_net_counters(iface_name)
+
+
+def get_net_delta(iface_name: str = "") -> dict:
+    """Byte RX/TX sejak pemanggilan sebelumnya (untuk volume trafik report)."""
+    global _net_prev
+    current = _read_net_counters(iface_name)
+    if current is None:
+        return {}
+    now = time.monotonic()
+    with _net_lock:
+        previous = _net_prev
+        _net_prev = (now, float(current[0]), float(current[1]))
+
+    if previous is None:
+        return {
+            "net_rx_bytes": 0,
+            "net_tx_bytes": 0,
+            "net_seconds": 0.0,
+        }
+
+    elapsed = max(now - previous[0], 0.0)
+    rx = current[0] - previous[1]
+    tx = current[1] - previous[2]
+    if rx < 0:
+        rx = current[0]
+    if tx < 0:
+        tx = current[1]
+    return {
+        "net_rx_bytes": max(0, int(rx)),
+        "net_tx_bytes": max(0, int(tx)),
+        "net_seconds": round(elapsed, 1),
+    }
+
+
 def is_service_mode() -> bool:
     """True bila berjalan sebagai service/boot (bukan dobel-klik interaktif).
 
@@ -511,56 +728,96 @@ def wait_for_network_online(max_wait: int = 300, step: int = 5) -> bool:
     return False
 
 
+def _speed_download() -> Optional[float]:
+    url = SPEEDTEST_DOWNLOAD_URL.format(bytes=SPEEDTEST_DOWNLOAD_BYTES)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Ubuntu-Panel-Agent",
+            "Cache-Control": "no-store",
+        },
+    )
+    started = time.monotonic()
+    total = 0
+    with urllib.request.urlopen(req, timeout=SPEEDTEST_TIMEOUT) as res:
+        while total < SPEEDTEST_DOWNLOAD_BYTES:
+            chunk = res.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+    elapsed = max(time.monotonic() - started, 0.001)
+    if total <= 0:
+        return None
+    return round((total * 8 / elapsed) / 1_000_000, 2)
+
+
+def _speed_upload() -> Optional[float]:
+    payload = b"0" * SPEEDTEST_UPLOAD_BYTES
+    req = urllib.request.Request(
+        SPEEDTEST_UPLOAD_URL,
+        data=payload,
+        headers={
+            "User-Agent": "Ubuntu-Panel-Agent",
+            "Content-Type": "application/octet-stream",
+            "Cache-Control": "no-store",
+        },
+        method="POST",
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(req, timeout=SPEEDTEST_TIMEOUT) as res:
+        res.read(1024)
+    elapsed = max(time.monotonic() - started, 0.001)
+    return round((len(payload) * 8 / elapsed) / 1_000_000, 2)
+
+
 def _speed_test_worker(server: str, token: str) -> None:
-    """Ukur throughput ke server tanpa menahan heartbeat berikutnya."""
-    global _speed_result
+    """Ukur throughput PC → internet publik tanpa menahan heartbeat."""
+    global _speed_result, _speed_started, _speed_next_try
     try:
-        started = time.monotonic()
-        req = urllib.request.Request(
-            server.rstrip("/") + "/api/computers/speed-test?bytes=262144",
-            headers={"X-Agent-Token": token},
-        )
-        with urllib.request.urlopen(req, timeout=8) as res:
-            res.read()
-        elapsed = max(time.monotonic() - started, 0.001)
-        download = round((262144 * 8 / elapsed) / 1_000_000, 2)
-        started = time.monotonic()
-        upload_request = urllib.request.Request(
-            server.rstrip("/") + "/api/computers/speed-test",
-            data=b"0" * 262144,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "X-Agent-Token": token,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(upload_request, timeout=8) as res:
-            res.read()
-        elapsed = max(time.monotonic() - started, 0.001)
-        upload = round((262144 * 8 / elapsed) / 1_000_000, 2)
+        download = _speed_download()
+        upload = _speed_upload()
+        if download is None or upload is None:
+            raise OSError("speed test tidak menghasilkan data")
         with _speed_lock:
             _speed_result = {
                 "download_mbps": download,
                 "upload_mbps": upload,
                 "speed_test_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "speed_test_source": "internet",
             }
+            _speed_next_try = time.time() + SPEEDTEST_INTERVAL
     except (OSError, urllib.error.URLError, urllib.error.HTTPError):
-        pass
+        with _speed_lock:
+            _speed_next_try = time.time() + SPEEDTEST_RETRY
+    finally:
+        with _speed_lock:
+            _speed_started = False
 
 
 def get_speed_result(server: str, token: str) -> dict:
     global _speed_started
     with _speed_lock:
         result = dict(_speed_result)
-        should_start = not _speed_started
+        now = time.time()
+        if _speed_started or now < _speed_next_try:
+            return result
         if result["speed_test_at"]:
             try:
-                should_start = time.time() - time.mktime(time.strptime(result["speed_test_at"], "%Y-%m-%dT%H:%M:%S")) > 900
+                tested = time.mktime(
+                    time.strptime(
+                        result["speed_test_at"], "%Y-%m-%dT%H:%M:%S"
+                    )
+                )
+                if now - tested < SPEEDTEST_INTERVAL:
+                    return result
             except ValueError:
-                should_start = True
-        if should_start:
-            _speed_started = True
-            threading.Thread(target=_speed_test_worker, args=(server, token), daemon=True).start()
+                pass
+        _speed_started = True
+        threading.Thread(
+            target=_speed_test_worker,
+            args=(server, token),
+            daemon=True,
+        ).start()
     return result
 
 
@@ -1364,6 +1621,7 @@ def discover_server(timeout: float = 3.0) -> str:
 def send_heartbeat(server: str, token: str) -> Tuple[bool, Optional[float], dict]:
     global _last_latency, _last_hb_status
     payload = gather()
+    payload.update(get_net_delta(str(payload.get("iface_name") or "")))
     payload.update(get_speed_result(server, token))
     t0 = time.monotonic()
     req = urllib.request.Request(

@@ -29,6 +29,7 @@ from ..db.models import (
 )
 from ..services.audit import record
 from ..services.apmon import oui_vendor
+from ..services import computer_metrics
 from ..services import topology as topology_svc
 
 log = logging.getLogger(__name__)
@@ -519,6 +520,10 @@ class HeartbeatBody(BaseModel):
     download_mbps: float | None = None
     upload_mbps: float | None = None
     speed_test_at: str = ""
+    speed_test_source: str = ""
+    net_rx_bytes: float | None = None
+    net_tx_bytes: float | None = None
+    net_seconds: float | None = None
     agent_version: str = ""
     autostart_mode: str = ""  # task-scheduler+hklm-run+common-startup | hkcu-run | system
     smb_open: bool | None = None
@@ -805,17 +810,48 @@ def heartbeat(
     computer.interfaces = json.dumps(body.interfaces[:16])
     computer.cpu = body.cpu
     computer.mem = body.mem
+    pending_rx = float(computer.net_rx_pending or 0.0) + max(
+        0.0, min(float(body.net_rx_bytes or 0.0), 1e12)
+    )
+    pending_tx = float(computer.net_tx_pending or 0.0) + max(
+        0.0, min(float(body.net_tx_bytes or 0.0), 1e12)
+    )
+    saved_sample = computer_metrics.record_sample(
+        db,
+        computer.id,
+        body.cpu,
+        body.mem,
+        net_rx_bytes=pending_rx,
+        net_tx_bytes=pending_tx,
+    )
+    if saved_sample:
+        computer.net_rx_pending = 0.0
+        computer.net_tx_pending = 0.0
+    else:
+        computer.net_rx_pending = pending_rx
+        computer.net_tx_pending = pending_tx
     computer.internet_up = body.internet_up
     computer.latency_ms = body.latency_ms
     if body.download_mbps is not None:
         computer.download_mbps = max(0.0, min(body.download_mbps, 100000.0))
     if body.upload_mbps is not None:
         computer.upload_mbps = max(0.0, min(body.upload_mbps, 100000.0))
+    tested_at = None
     if body.speed_test_at:
         try:
-            computer.speed_test_at = datetime.fromisoformat(body.speed_test_at)
+            tested_at = datetime.fromisoformat(body.speed_test_at)
+            computer.speed_test_at = tested_at
         except ValueError:
             pass
+    if tested_at is not None:
+        computer_metrics.record_speed_sample(
+            db,
+            computer.id,
+            tested_at,
+            body.download_mbps,
+            body.upload_mbps,
+            source=body.speed_test_source,
+        )
     computer.agent_version = (body.agent_version or computer.agent_version or "")[:32]
     computer.autostart_mode = (body.autostart_mode or computer.autostart_mode or "")[:64]
     if body.smb_open is not None:
@@ -830,14 +866,6 @@ def heartbeat(
     computer.ap_ip = (body.ap_ip or "")[:45] if ctype == "WIFI" else ""
     computer.ap_mac = (body.ap_mac or "")[:128] if ctype == "WIFI" else ""
     computer.last_seen = datetime.utcnow()
-
-    # deteksi jalur koneksi PC → server (LAN / INTERNET)
-    computer.server_reach = _detect_server_reach(
-        db, computer.ip, computer.ap_mac, computer.ap_ip
-    )
-
-    # ping balik server→PC (bergantian dengan ping PC→server dari agent)
-    computer.latency_srv_ms = _ping_host(computer.ip)
 
     # Data ARP bersifat tambahan; konflik MAC tidak boleh membatalkan heartbeat.
     try:
@@ -864,7 +892,36 @@ def heartbeat(
         resp["command"] = cmd
         computer.pending_cmd = None      # sekali kirim — agent yang ACK hasilnya
         computer.cmd_issued_at = None
+
+    pc_ip = computer.ip
+    ap_mac = computer.ap_mac
+    ap_ip = computer.ap_ip
+    computer_id = computer.id
+    # Commit dulu: probe jaringan di bawah bisa makan beberapa detik dan
+    # tidak boleh menahan transaksi/AccessShareLock di managed_computers.
     db.commit()
+
+    try:
+        server_reach = _detect_server_reach(db, pc_ip, ap_mac, ap_ip)
+        # Tutup transaksi baca dari _detect_server_reach sebelum ping.
+        db.commit()
+        latency_srv_ms = _ping_host(pc_ip)
+        (
+            db.query(ManagedComputer)
+            .filter(ManagedComputer.id == computer_id)
+            .update(
+                {
+                    ManagedComputer.server_reach: server_reach,
+                    ManagedComputer.latency_srv_ms: latency_srv_ms,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.warning("server reach probe failed for %s", pc_ip, exc_info=True)
+
     return resp
 
 
@@ -1298,6 +1355,10 @@ def presence_check(
             status_code=503,
             detail="Database sibuk (banyak heartbeat bersamaan) — coba lagi beberapa detik",
         ) from e
+    # Lepas objek & tutup transaksi sebelum ping/ARP: probe bisa berdetik-detik
+    # dan tidak boleh menahan AccessShareLock di managed_computers.
+    db.expunge_all()
+    db.rollback()
     result = _presence_evidence(c, aps)
     _safe_record(db, user, "COMPUTER_PRESENCE", c.name or str(c.id), result["verdict"])
     return result
@@ -1336,6 +1397,11 @@ def bulk_presence(
             status_code=503,
             detail="Database sibuk (banyak heartbeat bersamaan) — coba lagi beberapa detik",
         ) from e
+
+    # Lepas objek & tutup transaksi sebelum ping/ARP serentak; jangan biarkan
+    # probe jaringan menahan lock tabel managed_computers.
+    db.expunge_all()
+    db.rollback()
 
     now = datetime.utcnow()
 

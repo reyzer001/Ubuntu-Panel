@@ -7,13 +7,14 @@ Prinsip:
 2. Urutan percobaan: mulai dari kredensial terakhir yang berhasil
    (``Camera.active_credential_id``), lalu sisanya sesuai ``order_index``.
    Berhenti di percobaan pertama yang sukses.
-3. Status ONLINE/OFFLINE dari ping IP (tanpa kredensial) agar tidak
+3. Status ONLINE/OFFLINE dari port kamera (tanpa kredensial) agar tidak
    memicu lockout kamera karena salah password berulang.
 """
 
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -27,7 +28,8 @@ from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 
 from ..core.security import decrypt_secret
 from ..db.database import SessionLocal
-from ..db.models import Camera, CameraCredential
+from ..db.models import Camera, CameraCredential, CameraEvent
+from . import telegram
 
 try:
     from ..routers.settings import get_cctv_global_cam_cred as _get_cctv_global_cam_cred
@@ -43,6 +45,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _PING_INTERVAL = int(os.environ.get("CAM_PING_INTERVAL", "60"))
 _OFFLINE_AFTER = 3
 _miss: dict[int, int] = {}
+# Kamera yang sudah pernah dinotifikasikan OFFLINE ke Telegram (cegah spam).
+_alerted_offline: set[int] = set()
 
 # cooldown agar satu kamera tidak dihantam berulang saat resolve kredensial
 _RESOLVE_COOLDOWN = 30.0
@@ -78,6 +82,23 @@ def bump_global_cred_version() -> int:
         _last_resolve.clear()
         _locked_until.clear()
     return _global_cred_version
+
+
+def reset_camera_cred_state(camera_id: int) -> None:
+    """Bersihkan cache kredensial/cooldown satu kamera.
+
+    Dipanggil setelah kredensial manual diubah agar password baru langsung
+    dipakai (tidak menunggu cooldown) dan tile yang gagal segera retry.
+    Lockout anti-bruteforce kamera TIDAK dibersihkan demi keamanan.
+    """
+    with _resolve_lock:
+        _cred_cache.pop(camera_id, None)
+        _last_resolve.pop(camera_id, None)
+        _failure_cooldown.pop(camera_id, None)
+        _global_fail.pop(camera_id, None)
+    _snapshot_cache.pop(camera_id, None)
+
+
 # cache snapshot dalam memori (key: camera_id, value: (data, content_type, timestamp))
 # Default TTL 2.5 detik untuk cache grid view responsif & ramah CPU
 _SNAPSHOT_TTL = float(os.environ.get("CAM_SNAPSHOT_TTL", "2.5"))
@@ -464,11 +485,12 @@ def resolve_credential(db, camera, force: bool = False) -> tuple[str, str] | Non
         if _failure_cooldown_check(camera.id):
             return None
 
-    # Cache hit: kredensial berhasil ditemukan dalam cooldown → pakai saja
+    # Cache hit: kredensial berhasil ditemukan dalam cooldown → pakai saja.
+    # force=True (tombol Tes) wajib memprobe ulang, jadi cache dilewati.
     now = time.time()
     with _resolve_lock:
         cached = _cred_cache.get(camera.id)
-        if cached and (now - cached[0]) < _RESOLVE_COOLDOWN:
+        if not force and cached and (now - cached[0]) < _RESOLVE_COOLDOWN:
             return cached[1], cached[2]
 
     # Cek lockout kamera (mis. Dahua anti-bruteforce)
@@ -813,12 +835,41 @@ def _ping_host(ip: str) -> bool:
         return False
 
 
+def port_open(ip: str, port: int, timeout: float = 0.35) -> bool:
+    if not ip or not port:
+        return False
+    try:
+        with socket.create_connection((ip, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def probe_ports(
+    ip: str,
+    port: int = 80,
+    rtsp_port: int = 554,
+    timeout: float = 0.35,
+) -> dict:
+    return {
+        "web": port_open(ip, port, timeout),
+        "rtsp": port_open(ip, rtsp_port, timeout),
+    }
+
+
 def _monitor_once() -> dict:
     db = SessionLocal()
     try:
         cams = [
-            {"id": c.id, "ip": c.ip}
-            for c in db.query(Camera.id, Camera.ip).all()
+            {
+                "id": c.id,
+                "ip": c.ip,
+                "port": c.port,
+                "rtsp_port": c.rtsp_port,
+            }
+            for c in db.query(
+                Camera.id, Camera.ip, Camera.port, Camera.rtsp_port
+            ).all()
         ]
     finally:
         db.close()
@@ -828,11 +879,18 @@ def _monitor_once() -> dict:
     workers = min(32, max(4, len(cams)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         alive = {cid for cid, ok in pool.map(
-            lambda d: (d["id"], _ping_host(d["ip"]) if d["ip"] else False), cams
+            lambda d: (
+                d["id"],
+                port_open(d["ip"], d["port"])
+                or port_open(d["ip"], d["rtsp_port"]),
+            ),
+            cams,
         ) if ok}
 
     now = datetime.utcnow()
     stats = {"online": 0, "offline": 0}
+    went_offline: list[dict] = []
+    recovered: list[dict] = []
     db = SessionLocal()
     try:
         rows = {c.id: c for c in db.query(Camera).all()}
@@ -846,13 +904,53 @@ def _monitor_once() -> dict:
                 if cam.status != "ONLINE":
                     cam.status = "ONLINE"
                     stats["online"] += 1
+                    db.add(
+                        CameraEvent(
+                            camera_id=cam.id,
+                            ip=cam.ip,
+                            name=cam.name,
+                            event="ONLINE",
+                            timestamp=now,
+                        )
+                    )
+                    if cam.id in _alerted_offline:
+                        _alerted_offline.discard(cam.id)
+                        recovered.append(
+                            {
+                                "name": cam.name,
+                                "ip": cam.ip,
+                                "vendor": cam.vendor,
+                            }
+                        )
             else:
                 n = _miss.get(cam.id, 0) + 1
                 _miss[cam.id] = n
                 if n >= _OFFLINE_AFTER and cam.status != "OFFLINE":
                     cam.status = "OFFLINE"
                     stats["offline"] += 1
+                    db.add(
+                        CameraEvent(
+                            camera_id=cam.id,
+                            ip=cam.ip,
+                            name=cam.name,
+                            event="OFFLINE",
+                            timestamp=now,
+                        )
+                    )
+                    _alerted_offline.add(cam.id)
+                    went_offline.append(
+                        {
+                            "name": cam.name,
+                            "ip": cam.ip,
+                            "vendor": cam.vendor,
+                        }
+                    )
         db.commit()
+        if went_offline or recovered:
+            try:
+                telegram.notify_cctv_changes(db, went_offline, recovered)
+            except Exception:  # noqa: BLE001
+                log.warning("gagal mengirim notifikasi Telegram CCTV", exc_info=True)
         return stats
     finally:
         db.close()

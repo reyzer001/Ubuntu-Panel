@@ -28,7 +28,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 bearer = HTTPBearer(auto_error=False)
 
 # scope step-up yang dikenal + batas percobaan gagal (rate limit sederhana)
-VALID_STEP_UP_SCOPES = ("cctv",)
+VALID_STEP_UP_SCOPES = ("cctv", "myzrok")
 _STEP_UP_MAX_FAILS = 5
 _STEP_UP_WINDOW = 60.0
 _step_up_fails: dict[str, list[float]] = {}

@@ -6,6 +6,9 @@ Semua endpoint di router ini dijaga dua lapis:
 2. ``require_step_up("cctv")`` — wajib verifikasi ulang password.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -140,6 +143,7 @@ def camera_status_overview(
 
 
 class CredentialIn(BaseModel):
+    id: int | None = None
     username: str = ""
     password: str = ""
 
@@ -176,22 +180,55 @@ def _validate_protocol(protocol: str) -> str:
 
 
 def _replace_credentials(db, camera: Camera, creds: list[CredentialIn]) -> None:
-    db.query(CameraCredential).filter(
-        CameraCredential.camera_id == camera.id
-    ).delete(synchronize_session=False)
-    camera.active_credential_id = None
+    """Sinkronkan kredensial manual kamera tanpa menghapus password lama.
+
+    Semantik:
+    - ``id`` cocok dengan kredensial lama → update username/urutan; password
+      kosong berarti PERTAHANKAN password lama (tidak ditampilkan di UI).
+    - ``id`` tidak dikirim → dianggap dihapus.
+    - baris baru wajib punya username + password; baris kosong diabaikan.
+    """
+    existing = {
+        c.id: c
+        for c in db.query(CameraCredential)
+        .filter(CameraCredential.camera_id == camera.id)
+        .all()
+    }
+    kept: set[int] = set()
+
     for idx, item in enumerate(creds):
         username = (item.username or "").strip()
-        if not username and not item.password:
+        password = item.password or ""
+        old = existing.get(item.id) if item.id else None
+
+        if old is not None:
+            if not username and not password:
+                # Baris lama dikosongkan user → hapus.
+                continue
+            old.username = username[:128]
+            old.order_index = idx
+            if password:
+                old.password_enc = encrypt_secret(password)
+            kept.add(old.id)
+            continue
+
+        if not username or not password:
             continue
         db.add(
             CameraCredential(
                 camera_id=camera.id,
                 username=username[:128],
-                password_enc=encrypt_secret(item.password),
+                password_enc=encrypt_secret(password),
                 order_index=idx,
             )
         )
+
+    for cred_id, obj in existing.items():
+        if cred_id in kept:
+            continue
+        if camera.active_credential_id == cred_id:
+            camera.active_credential_id = None
+        db.delete(obj)
     db.flush()
 
 
@@ -562,6 +599,10 @@ class ImportBody(BaseModel):
     all_cctv: bool = False
 
 
+class PortCheckBody(BaseModel):
+    camera_ids: list[int] = []
+
+
 def _create_cctv_cameras_from_aps(db: Session, aps: list[AccessPoint]) -> int:
     """Helper untuk membuat Camera dari AccessPoint dengan deduplikasi ketat."""
     if not aps:
@@ -577,12 +618,45 @@ def _create_cctv_cameras_from_aps(db: Session, aps: list[AccessPoint]) -> int:
         db.add(cam_group)
         db.flush()
 
-    created = 0
-    seen_batch_ips = set()
+    candidates: list[AccessPoint] = []
+    seen_candidate_ips: set[str] = set()
     for ap in aps:
         if not ap.ip:
             continue
-        if ap.id in existing_ap_ids or ap.ip in existing_ips or ap.ip in seen_batch_ips:
+        if (
+            ap.id in existing_ap_ids
+            or ap.ip in existing_ips
+            or ap.ip in seen_candidate_ips
+        ):
+            continue
+        seen_candidate_ips.add(ap.ip)
+        candidates.append(ap)
+
+    if not candidates:
+        return 0
+
+    with ThreadPoolExecutor(
+        max_workers=min(24, max(4, len(candidates)))
+    ) as pool:
+        port_map = dict(
+            pool.map(
+                lambda ap: (ap.id, cammon.probe_ports(ap.ip)),
+                candidates,
+            )
+        )
+
+    reachable = [
+        ap
+        for ap in candidates
+        if any(port_map.get(ap.id, {}).values())
+    ]
+    if not reachable:
+        return 0
+
+    created = 0
+    seen_batch_ips = set()
+    for ap in reachable:
+        if ap.ip in seen_batch_ips:
             continue
 
         seen_batch_ips.add(ap.ip)
@@ -712,6 +786,79 @@ def import_auto_cctv(
 
     total_cameras = db.query(Camera).count()
     return {"ok": True, "created": created, "total": total_cameras}
+
+
+@router.post("/port-check")
+def check_camera_ports(
+    body: PortCheckBody | None = None,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cek port web/RTSP kamera dan sinkronkan status ONLINE/OFFLINE."""
+    query = db.query(Camera)
+    if body and body.camera_ids:
+        ids = list(dict.fromkeys(body.camera_ids))
+        query = query.filter(Camera.id.in_(ids))
+    cams = query.order_by(Camera.ip.asc()).all()
+    if not cams:
+        return {
+            "checked": 0,
+            "open": 0,
+            "closed": 0,
+            "cameras": [],
+        }
+
+    with ThreadPoolExecutor(
+        max_workers=min(24, max(4, len(cams)))
+    ) as pool:
+        checks = dict(
+            pool.map(
+                lambda cam: (
+                    cam.id,
+                    cammon.probe_ports(
+                        cam.ip, cam.port, cam.rtsp_port
+                    ),
+                ),
+                cams,
+            )
+        )
+
+    now = datetime.utcnow()
+    results = []
+    opened = 0
+    for cam in cams:
+        ports = checks.get(cam.id, {})
+        is_open = bool(ports.get("web") or ports.get("rtsp"))
+        if is_open:
+            opened += 1
+            cam.status = "ONLINE"
+            cam.last_seen = now
+        else:
+            cam.status = "OFFLINE"
+        results.append(
+            {
+                "id": cam.id,
+                "name": cam.name,
+                "ip": cam.ip,
+                "web_open": bool(ports.get("web")),
+                "rtsp_open": bool(ports.get("rtsp")),
+                "open": is_open,
+            }
+        )
+
+    audit.record(
+        db,
+        username,
+        "CAM_PORT_CHECK",
+        f"{opened}/{len(cams)} kamera port terbuka",
+    )
+    db.commit()
+    return {
+        "checked": len(cams),
+        "open": opened,
+        "closed": len(cams) - opened,
+        "cameras": results,
+    }
 
 
 # ------------------------------------------------------------- credentials

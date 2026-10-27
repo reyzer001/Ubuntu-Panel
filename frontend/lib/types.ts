@@ -1,6 +1,7 @@
 export interface Metrics {
   time: string;
   cpu: number;
+  cpu_per_core?: number[];
   cpu_kernel: number;
   cpu_cores: number;
   ram: number;
@@ -22,7 +23,17 @@ export interface Metrics {
   net_tx_rate: number;
   disk_read_rate: number;
   disk_write_rate: number;
+  cpu_temperature?: number | null;
+  temperatures?: TemperatureSensor[];
   net_interfaces?: IfaceRate[];
+}
+
+export interface TemperatureSensor {
+  chip: string;
+  label: string;
+  current: number;
+  high: number | null;
+  critical: number | null;
 }
 
 export interface SystemInfo {
@@ -289,6 +300,7 @@ export interface HistoryPoint {
   ram: number;
   rx: number;
   tx: number;
+  temp?: number | null;
 }
 
 export interface BackupRun {
@@ -727,4 +739,211 @@ export interface PrinterResolveResult {
   };
   printers: SharedPrinter[];
   total: number;
+}
+
+export interface ReportMetricStat {
+  avg: number | null;
+  min: number | null;
+  max: number | null;
+}
+
+export interface ReportSeriesPoint {
+  t: string | null;
+  cpu: number;
+  ram: number;
+  rx: number;
+  tx: number;
+}
+
+export interface ReportNet {
+  rx_total_bytes: number;
+  tx_total_bytes: number;
+  rx_avg_rate: number;
+  tx_avg_rate: number;
+}
+
+export interface ReportComputerRow {
+  id: number;
+  name: string;
+  hostname: string;
+  ip: string;
+  group_name: string;
+  status: string;
+  cpu_avg: number;
+  cpu_max: number;
+  ram_avg: number;
+  ram_max: number;
+  score: number;
+  samples: number;
+}
+
+export interface ReportComputers {
+  total: number;
+  online: number;
+  with_data: number;
+  sample_count: number;
+  cpu: ReportMetricStat;
+  ram: ReportMetricStat;
+  net: ReportNet;
+  series: ReportSeriesPoint[];
+  top: ReportComputerRow[];
+}
+
+export interface ReportSpeedComputer {
+  id: number | null;
+  name: string;
+  hostname: string;
+  ip: string;
+  group_name: string;
+  conn_type: string;
+  server_reach: string;
+  status: string;
+  avg_download_mbps: number;
+  avg_upload_mbps: number;
+  score: number;
+  min_download_mbps: number;
+  max_download_mbps: number;
+  min_upload_mbps: number;
+  max_upload_mbps: number;
+  samples: number;
+  last_tested_at: string | null;
+  last_received_at: string | null;
+}
+
+export interface ReportSpeedSample {
+  id: number | null;
+  name: string;
+  hostname: string;
+  ip: string;
+  group_name: string;
+  conn_type: string;
+  server_reach: string;
+  status: string;
+  download_mbps: number;
+  upload_mbps: number;
+  score: number;
+  tested_at: string | null;
+  received_at: string | null;
+}
+
+export interface ReportSpeedIsp {
+  download_mbps: number | null;
+  upload_mbps: number | null;
+  peak_download_mbps: number | null;
+  peak_upload_mbps: number | null;
+  utilization_download_pct: number | null;
+  utilization_upload_pct: number | null;
+  utilization_pct: number | null;
+  status: "unset" | "safe" | "near" | "over";
+}
+
+export interface ReportSpeed {
+  hours: number;
+  total: number;
+  computers_with_data: number;
+  sample_count: number;
+  avg_download_mbps: number | null;
+  avg_upload_mbps: number | null;
+  avg_score_mbps: number | null;
+  top_fastest: ReportSpeedComputer[];
+  top_slowest: ReportSpeedComputer[];
+  peak: ReportSpeedSample | null;
+  lowest: ReportSpeedSample | null;
+  peak_download: ReportSpeedSample | null;
+  peak_upload: ReportSpeedSample | null;
+  isp: ReportSpeedIsp;
+}
+
+export interface ReportDowntime {
+  start: string | null;
+  end: string | null;
+  seconds: number;
+  ongoing: boolean;
+}
+
+export interface ReportCameraProblem {
+  id: number;
+  name: string;
+  ip: string;
+  status: string;
+  currently_offline: boolean;
+  downtime: ReportDowntime[];
+  total_downtime_seconds: number;
+  last_seen: string | null;
+}
+
+export interface ReportCctv {
+  total: number;
+  normal: number;
+  problem_count: number;
+  online_now: number;
+  offline_now: number;
+  problems: ReportCameraProblem[];
+}
+
+export interface ReportData {
+  generated_at: string;
+  window_start: string;
+  window_end: string;
+  hours: number;
+  computers: ReportComputers;
+  speed: ReportSpeed;
+  cctv: ReportCctv;
+}
+
+export interface ReportDateRow {
+  date: string;
+  computers: number;
+  raw_samples: number;
+  hourly_buckets: number;
+  speed_samples: number;
+  has_raw: boolean;
+  has_hourly: boolean;
+  has_speed: boolean;
+  first_ts: string | null;
+  last_ts: string | null;
+}
+
+export interface ReportDates {
+  generated_at: string;
+  days: number;
+  timezone: string;
+  retention: {
+    raw_hours: number;
+    rollup_days: number;
+    speed_days: number;
+  };
+  dates: ReportDateRow[];
+}
+
+export interface ReportSettings {
+  enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  smtp_tls: boolean;
+  smtp_ssl: boolean;
+  from_addr: string;
+  recipients: string[];
+  schedule: string;
+  hours: number;
+  last_sent: string | null;
+  smtp_password_set: boolean;
+  isp_download_mbps: number | null;
+  isp_upload_mbps: number | null;
+}
+
+export interface SmtpTestResult {
+  ok: boolean;
+  message: string;
+}
+
+export interface MyzrokStatus {
+  running: boolean;
+  pid: number | null;
+  url: string;
+  login_url: string;
+  target: string;
+  name: string;
+  log_tail: string[];
 }

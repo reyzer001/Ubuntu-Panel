@@ -519,13 +519,22 @@ function PageAccessTab({
   onSave: (pages: string[]) => void;
   pending: boolean;
 }) {
-  const [cctv, setCctv] = useState((user.page_access || []).includes("cctv"));
+  const [pages, setPages] = useState<string[]>(user.page_access || []);
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
-    setCctv((user.page_access || []).includes("cctv"));
+    setPages(user.page_access || []);
     setDirty(false);
   }, [user]);
+
+  const toggle = (page: string, checked: boolean) => {
+    setPages((prev) =>
+      checked
+        ? Array.from(new Set([...prev, page]))
+        : prev.filter((p) => p !== page)
+    );
+    setDirty(true);
+  };
 
   if (!isSuperadmin) {
     return (
@@ -552,11 +561,20 @@ function PageAccessTab({
         </div>
         <input
           type="checkbox"
-          checked={cctv}
-          onChange={(e) => {
-            setCctv(e.target.checked);
-            setDirty(true);
-          }}
+          checked={pages.includes("cctv")}
+          onChange={(e) => toggle("cctv", e.target.checked)}
+          className="h-4 w-4 accent-[#5ea5ff]"
+        />
+      </label>
+      <label className="flex cursor-pointer items-center justify-between rounded-lg border border-line bg-panel2 px-3 py-2 text-[11px] text-muted">
+        <div>
+          <div className="font-semibold text-muted">Report</div>
+          <div className="text-muted2">Akses laporan server, komputer & CCTV</div>
+        </div>
+        <input
+          type="checkbox"
+          checked={pages.includes("report")}
+          onChange={(e) => toggle("report", e.target.checked)}
           className="h-4 w-4 accent-[#5ea5ff]"
         />
       </label>
@@ -565,7 +583,7 @@ function PageAccessTab({
           type="button"
           className="btn btn-primary py-1.5 text-[10px]"
           disabled={!dirty || pending}
-          onClick={() => onSave(cctv ? ["cctv"] : [])}
+          onClick={() => onSave(pages)}
         >
           {pending ? "Menyimpan…" : "Simpan Izin"}
         </button>

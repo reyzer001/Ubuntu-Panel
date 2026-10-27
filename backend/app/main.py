@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from .core.config import get_settings
 from .core.security import decode_token
@@ -74,8 +74,24 @@ def _auto_migrate() -> None:
                 ("upload_mbps", "FLOAT", "NULL"),
                 ("speed_test_at", "TIMESTAMP", "NULL"),
                 ("ap_seen_at", "TIMESTAMP", "NULL"),
+                ("net_rx_pending", "FLOAT", "0"),
+                ("net_tx_pending", "FLOAT", "0"),
             ],
             "web_services": [("tunnel_auto", "BOOLEAN", "false")],
+            "metric_samples": [("temp", "FLOAT", "NULL")],
+            "computer_metric_samples": [
+                ("net_rx_bytes", "FLOAT", "0"),
+                ("net_tx_bytes", "FLOAT", "0"),
+                ("net_seconds", "FLOAT", "0"),
+            ],
+            "computer_metric_hourly": [
+                ("net_rx_bytes", "FLOAT", "0"),
+                ("net_tx_bytes", "FLOAT", "0"),
+                ("net_seconds", "FLOAT", "0"),
+            ],
+            "computer_speed_samples": [
+                ("source", "VARCHAR(16)", "'server'"),
+            ],
         }
 
         for table, cols in additions.items():
@@ -85,20 +101,21 @@ def _auto_migrate() -> None:
             for col_name, col_type, default in cols:
                 if col_name in existing:
                     continue
-                with engine.begin() as conn:
-                    if str(engine.url).startswith("sqlite"):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                         conn.execute(
-                            __import__("sqlalchemy").text(
-                                f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type} DEFAULT {default}"
-                            )
-                        )
-                    else:
-                        conn.execute(
-                            __import__("sqlalchemy").text(
+                            text(
                                 f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type} DEFAULT {default}"
                             )
                         )
                     log.info("auto-migrate: added %s.%s", table, col_name)
+                except Exception as exc:
+                    # Tabel sedang di-lock transaksi lain: lewati kolom ini
+                    # agar startup tidak menggantung selamanya.
+                    log.warning(
+                        "auto-migrate: lewati %s.%s (%s)", table, col_name, exc
+                    )
     except Exception as exc:
         log.warning("auto-migrate failed: %s", exc)
 from .routers import (
@@ -112,9 +129,11 @@ from .routers import (
     firewall,
     logs,
     maintenance,
+    myzrok,
     panel_users,
     printers,
     processes,
+    report,
     services,
     settings,
     system,
@@ -128,6 +147,8 @@ from .services import backup as backup_service
 from .services import collectors
 from .services import topology as topology_service
 from .services import dbcleanup as dbcleanup_service
+from .services import metrics_history
+from .services import report_scheduler
 from .services import websites as webrunner
 
 
@@ -140,6 +161,8 @@ async def lifespan(app: FastAPI):
     cammon.start_monitor()
     topology_service.start_scheduler()
     dbcleanup_service.start_scheduler()
+    metrics_history.start_sampler()
+    report_scheduler.start_scheduler()
     webrunner.start_monitor()
     t = threading.Thread(
         target=_discovery_listener,
@@ -181,7 +204,9 @@ for router in (
     computers,
     printers,
     cameras,
+    report,
     settings,
+    myzrok,
 ):
     app.include_router(router.router, prefix="/api")
 

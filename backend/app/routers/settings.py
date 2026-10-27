@@ -1,3 +1,5 @@
+import math
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -6,7 +8,7 @@ from ..core.deps import get_current_user, require_page_access, require_superadmi
 from ..core.security import decrypt_secret, encrypt_secret
 from ..db.database import get_db
 from ..db.models import AppSetting
-from ..services import audit
+from ..services import audit, telegram
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -159,6 +161,74 @@ def clear_cctv_camera_cred(
     return {"ok": True}
 
 
+class TelegramConfigBody(BaseModel):
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+
+
+@router.get("/cctv-telegram", dependencies=[Depends(require_superadmin)])
+def get_cctv_telegram(
+    _: str = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    return telegram.public_config(db)
+
+
+@router.put("/cctv-telegram", dependencies=[Depends(require_superadmin)])
+def set_cctv_telegram(
+    body: TelegramConfigBody,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return telegram.save_config(
+            db,
+            enabled=body.enabled,
+            bot_token=body.bot_token,
+            chat_id=body.chat_id,
+            actor=username,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.delete("/cctv-telegram", dependencies=[Depends(require_superadmin)])
+def clear_cctv_telegram(
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    telegram.clear_config(db, actor=username)
+    return {"ok": True}
+
+
+@router.post("/cctv-telegram/test", dependencies=[Depends(require_superadmin)])
+def test_cctv_telegram(
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    cfg = telegram.get_config(db)
+    if not cfg["bot_token"] or not cfg["chat_id"]:
+        raise HTTPException(
+            400, "Isi dan simpan Bot Token + Chat ID terlebih dahulu"
+        )
+    ok, err = telegram.send_message(
+        cfg["bot_token"],
+        cfg["chat_id"],
+        "Tes notifikasi CCTV dari Ubuntu Panel berhasil.",
+    )
+    audit.record(
+        db,
+        username,
+        "TELEGRAM_TEST",
+        "",
+        "SUCCESS" if ok else "FAILED",
+    )
+    db.commit()
+    if not ok:
+        raise HTTPException(502, f"Telegram menolak pesan: {err}")
+    return {"ok": True}
+
+
 CCTV_MODE_KEY = "cctv_default_mode"
 
 
@@ -200,3 +270,74 @@ def get_cctv_global_cam_cred(db: Session) -> tuple[str | None, str | None]:
     if not username or not password:
         return None, None
     return username, password
+
+
+THERMAL_WARM_KEY = "thermal_warm_threshold"
+THERMAL_HOT_KEY = "thermal_hot_threshold"
+DEFAULT_THERMAL_WARM = 70.0
+DEFAULT_THERMAL_HOT = 85.0
+
+
+class ThermalThresholdBody(BaseModel):
+    warm: float
+    hot: float
+
+
+def _thermal_value(db: Session, key: str, default: float) -> float:
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    if row is None or not row.value_enc:
+        return default
+    try:
+        return float(row.value_enc)
+    except (TypeError, ValueError):
+        return default
+
+
+def _set_thermal_value(db: Session, key: str, value: float) -> None:
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    raw = f"{value:.1f}"
+    if row is None:
+        db.add(AppSetting(key=key, value_enc=raw))
+    else:
+        row.value_enc = raw
+        from datetime import datetime
+
+        row.updated_at = datetime.utcnow()
+
+
+@router.get("/thermal")
+def get_thermal_thresholds(
+    _: str = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    return {
+        "warm": _thermal_value(db, THERMAL_WARM_KEY, DEFAULT_THERMAL_WARM),
+        "hot": _thermal_value(db, THERMAL_HOT_KEY, DEFAULT_THERMAL_HOT),
+    }
+
+
+@router.put("/thermal", dependencies=[Depends(require_superadmin)])
+def set_thermal_thresholds(
+    body: ThermalThresholdBody,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    warm = round(float(body.warm), 1)
+    hot = round(float(body.hot), 1)
+    if not (math.isfinite(warm) and math.isfinite(hot)):
+        raise HTTPException(400, "Threshold harus berupa angka valid")
+    if not (0 <= warm < 125):
+        raise HTTPException(400, "Warm threshold harus 0 - 124 °C")
+    if not (0 < hot <= 125):
+        raise HTTPException(400, "Hot threshold harus 1 - 125 °C")
+    if hot <= warm:
+        raise HTTPException(400, "Hot threshold harus lebih besar dari Warm")
+    _set_thermal_value(db, THERMAL_WARM_KEY, warm)
+    _set_thermal_value(db, THERMAL_HOT_KEY, hot)
+    audit.record(
+        db,
+        username,
+        "THERMAL_THRESHOLDS_SET",
+        f"warm={warm:.1f} hot={hot:.1f}",
+    )
+    db.commit()
+    return {"warm": warm, "hot": hot}

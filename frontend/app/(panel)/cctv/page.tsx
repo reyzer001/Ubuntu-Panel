@@ -95,6 +95,22 @@ function defStream(vendor: string, channel: number) {
   if (v.includes("axis")) return `/axis-media/media.amp?camera=${channel}`;
   return `/stream${channel}`;
 }
+
+function getTileBorderClass(camera: Camera, failed: boolean) {
+  if (camera.status !== "ONLINE" || failed) {
+    return "border-[#ff6b6b] ring-1 ring-[#ff6b6b]/40";
+  }
+  return "border-line";
+}
+
+type PreviewCam = Camera & {
+  onEdit: () => void;
+  onCreds: () => void;
+  onTest: () => void;
+  onDetect: () => void;
+  onDelete: () => void;
+};
+
 export default function CctvPage() {
   const toast = useToast();
   const { confirm } = useConfirm();
@@ -120,6 +136,8 @@ export default function CctvPage() {
   const [newGroup, setNewGroup] = useState("");
   const [showGlobalSettings, setShowGlobalSettings] = useState(false);
   const [liveAll, setLiveAll] = useState(false);
+
+  const [previewCam, setPreviewCam] = useState<PreviewCam | null>(null);
   const [page, setPage] = useState(1);
   // Naik tiap sesi terverifikasi/diperpanjang → tile yang gagal ikut coba ulang.
   const [unlockEpoch, setUnlockEpoch] = useState(0);
@@ -194,6 +212,29 @@ export default function CctvPage() {
   // di-apply otomatis ke grid. Grid selalu standby livestream saat halaman
   // dibuka. Nilai server hanya dipakai sebagai tampilan di modal Pengaturan;
   // perubahan eksplisit user via modal/toggle yang mengubah liveAll.
+
+  const cameras = camsQuery.data?.cameras ?? [];
+  const summary = camsQuery.data?.summary ?? { total: 0, online: 0, offline: 0, ping_interval: 0, offline_after: 0 };
+  const filtered = useMemo(() => {
+    let result = cameras;
+    if (search) {
+      const s = search.toLowerCase();
+      result = result.filter(
+        (c) =>
+          c.name.toLowerCase().includes(s) ||
+          c.ip.toLowerCase().includes(s) ||
+          c.vendor.toLowerCase().includes(s) ||
+          c.model.toLowerCase().includes(s),
+      );
+    }
+    if (groupFilter !== "all") {
+      result = result.filter((c) => c.group_id === groupFilter);
+    }
+    if (statusFilter !== "all") {
+      result = result.filter((c) => c.status === statusFilter.toUpperCase());
+    }
+    return result;
+  }, [cameras, search, groupFilter, statusFilter]);
 
   useEffect(() => {
     if (camsQuery.error instanceof ApiError && camsQuery.error.status === 428) {
@@ -372,6 +413,28 @@ export default function CctvPage() {
       toast.error(err instanceof ApiError ? err.message : "Gagal impor otomatis"),
   });
 
+  const checkPorts = useMutation({
+    mutationFn: () =>
+      api<{ checked: number; open: number; closed: number }>(
+        "/cameras/port-check",
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+          elevated: "cctv",
+        }
+      ),
+    onSuccess: (res) => {
+      toast.success(
+        `Cek port selesai: ${res.open} terbuka, ${res.closed} tertutup`
+      );
+      queryClient.invalidateQueries({ queryKey: ["cameras"] });
+    },
+    onError: (err) =>
+      toast.error(
+        err instanceof ApiError ? err.message : "Gagal cek port kamera"
+      ),
+  });
+
   const addGroup = useMutation({
     mutationFn: (name: string) =>
       api("/cameras/groups", {
@@ -386,33 +449,6 @@ export default function CctvPage() {
     onError: (err) =>
       toast.error(err instanceof ApiError ? err.message : "Gagal menambah grup"),
   });
-
-  const cameras = camsQuery.data?.cameras ?? [];
-  // Ringkasan dari backend (status ping); fallback hitung dari data kamera.
-  const summary = useMemo(() => {
-    const s = camsQuery.data?.summary;
-    if (s) return { total: s.total, online: s.online, offline: s.offline };
-    return {
-      total: cameras.length,
-      online: cameras.filter((c) => c.status === "ONLINE").length,
-      offline: cameras.filter((c) => c.status !== "ONLINE").length,
-    };
-  }, [camsQuery.data?.summary, cameras]);
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return cameras.filter((c) => {
-      if (groupFilter !== "all" && c.group_id !== groupFilter) return false;
-      if (statusFilter === "online" && c.status !== "ONLINE") return false;
-      if (statusFilter === "offline" && c.status === "ONLINE") return false;
-      if (!q) return true;
-      return (
-        c.name.toLowerCase().includes(q) ||
-        c.ip.toLowerCase().includes(q) ||
-        c.vendor.toLowerCase().includes(q) ||
-        c.model.toLowerCase().includes(q)
-      );
-    });
-  }, [cameras, search, groupFilter, statusFilter]);
 
   // Pagination frontend: slice hasil filter, default 20/halaman.
   // Standby livestream aman karena maksimal `pageSize` stream ter-mount bersamaan.
@@ -552,6 +588,16 @@ export default function CctvPage() {
               }}
             >
               <Download size={13} /> {importAllCctv.isPending ? "Mengimpor…" : "Impor Otomatis Full CCTV"}
+            </button>
+            <button
+              type="button"
+              className="btn flex items-center gap-1.5"
+              disabled={checkPorts.isPending}
+              title="Cek port web/RTSP semua kamera dan sinkronkan status"
+              onClick={() => checkPorts.mutate()}
+            >
+              <Radar size={13} />{" "}
+              {checkPorts.isPending ? "Cek Port…" : "Cek Port"}
             </button>
             <button
               type="button"
@@ -714,6 +760,7 @@ export default function CctvPage() {
                     });
                     if (ok) deleteCam.mutate(cam.id);
                   }}
+                  setPreviewCam={setPreviewCam}
                 />
               ))}
               </div>
@@ -837,6 +884,19 @@ export default function CctvPage() {
           onImport={() => importCams.mutate(Array.from(importSel))}
           onImportAll={() => importAllCctv.mutate()}
           onClose={() => setShowImport(false)}
+        />
+      ) : null}
+
+      {previewCam ? (
+        <CameraPreviewModal
+          camera={previewCam}
+          liveAll={liveAll}
+          onClose={() => setPreviewCam(null)}
+          onTest={previewCam.onTest as () => void}
+          onDetect={previewCam.onDetect as () => void}
+          onCreds={previewCam.onCreds as () => void}
+          onEdit={previewCam.onEdit as () => void}
+          onDelete={previewCam.onDelete as () => void}
         />
       ) : null}
     </div>
@@ -1050,6 +1110,7 @@ function CameraTile({
   onTest,
   onDetect,
   onDelete,
+  setPreviewCam,
 }: {
   camera: Camera;
   tick: number;
@@ -1060,7 +1121,23 @@ function CameraTile({
   onTest: () => void;
   onDetect: () => void;
   onDelete: () => void;
+  setPreviewCam: (cam: PreviewCam) => void;
 }) {
+
+  // Preview mode: klik gambar untuk menampilkan tile kamera dalam mode preview
+  const openPreview = () => {
+    // Hanya buka preview jika di layar desktop (untuk UX yang lebih baik)
+    if (window.innerWidth >= 768) {
+      setPreviewCam({
+        ...camera,
+        onEdit,
+        onCreds,
+        onTest,
+        onDetect,
+        onDelete,
+      } as Camera & { onEdit: () => void; onCreds: () => void; onTest: () => void; onDetect: () => void; onDelete: () => void });
+    }
+  };
   const [failed, setFailed] = useState(false);
   const [override, setOverride] = useState<boolean | null>(null);
   // Diagnosis presisi dari backend saat tile gagal (locked/cooldown/
@@ -1075,6 +1152,7 @@ function CameraTile({
   // mengoreksi saat tile benar-benar di luar viewport.
   const tileRef = useRef<HTMLDivElement>(null);
   const [inView, setInView] = useState(true);
+  const [showTools, setShowTools] = useState(false);
 
   // Toggle global Live Semua / Snapshot: reset override per-tile.
   useEffect(() => {
@@ -1179,16 +1257,16 @@ function CameraTile({
     else setLiveLoading(false);
   }, [camera.id, live, inView]);
 
-  // Hilangkan status loading otomatis setelah 2.5 detik agar overlay "Memuat live..."
-  // tidak menutupi gambar stream yang sedang berjalan lancar (MJPEG multipart di browser
-  // tidak selalu menembakkan event onLoad konvensional secara berulang).
-  useEffect(() => {
-    if (!liveLoading) return;
-    const timer = setTimeout(() => {
-      setLiveLoading(false);
-    }, 2500);
-    return () => clearTimeout(timer);
-  }, [liveLoading]);
+    // Hilangkan status loading otomatis setelah 2.5 detik agar overlay "Memuat live..."
+    // tidak menutupi gambar stream yang sedang berjalan lancar (MJPEG multipart di browser
+    // tidak selalu menembakkan event onLoad konvensional secara berulang).
+    useEffect(() => {
+      if (!liveLoading) return;
+      const timer = setTimeout(() => {
+        setLiveLoading(false);
+      }, 2500);
+      return () => clearTimeout(timer);
+    }, [liveLoading]);
 
   // Saat tile gagal: tanya backend penyebab pastinya (sekali per kegagalan)
   // agar overlay bisa tulis "kamera mengunci login" vs "password tidak cocok".
@@ -1213,7 +1291,7 @@ function CameraTile({
   }, [failed, camera.id, camera.status]);
 
   return (
-    <div ref={tileRef} className="overflow-hidden rounded-card border border-line bg-panel">
+    <div ref={tileRef} className={`overflow-hidden rounded-card ${getTileBorderClass(camera, failed)} bg-panel`}>
       <div className="relative aspect-video w-full bg-black/60">
         {camera.status === "ONLINE" && src && !failed ? (
           // eslint-disable-next-line @next/next/no-img-element
@@ -1225,10 +1303,8 @@ function CameraTile({
             alt={camera.name || camera.ip}
             className="h-full w-full object-cover cursor-pointer"
             onClick={() => {
-              setOverride((v) => !(v ?? liveAll));
-              setFailed(false);
-              setDiag(null);
-              setLiveRetries(0);
+              setShowTools((prev) => !prev);
+              openPreview();
             }}
             title={live ? "Sedang Live Stream (klik untuk kembali ke mode grid)" : "Klik gambar untuk Live Stream kamera ini"}
             onLoad={() => { setLiveLoading(false); }}
@@ -1315,85 +1391,87 @@ function CameraTile({
           ) : null}
         </div>
       </div>
-      <div className="p-2.5">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="truncate text-[12px] font-semibold text-muted">
-              {camera.name || camera.ip}
+      {showTools && (
+        <div className="p-2.5">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className="truncate text-[12px] font-semibold text-muted">
+                {camera.name || camera.ip}
+              </div>
+              <div className="truncate font-mono text-[10px] text-muted2">
+                {camera.ip}
+                {camera.vendor ? ` · ${camera.vendor}` : ""}
+              </div>
             </div>
-            <div className="truncate font-mono text-[10px] text-muted2">
-              {camera.ip}
-              {camera.vendor ? ` · ${camera.vendor}` : ""}
+            <div className="flex shrink-0 items-center gap-1">
+              <button
+                type="button"
+                className="icon-btn"
+                title={live ? "Stop Live" : "Live View"}
+                onClick={() => {
+                  setOverride((v) => !(v ?? liveAll));
+                  setFailed(false);
+                  setDiag(null);
+                  setLiveRetries(0);
+                }}
+              >
+                {live ? <Square size={13} /> : <Play size={13} />}
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Buka halaman kamera"
+                onClick={() =>
+                  camera.web_url &&
+                  window.open(camera.web_url, "_blank", "noopener")
+                }
+              >
+                <ExternalLink size={13} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Tes login"
+                onClick={onTest}
+              >
+                <ShieldCheck size={13} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Deteksi path snapshot (cari URL gambar yang cocok)"
+                onClick={onDetect}
+              >
+                <Radar size={13} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Kredensial"
+                onClick={onCreds}
+              >
+                <KeyRound size={13} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Edit"
+                onClick={onEdit}
+              >
+                <Pencil size={13} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn text-bad"
+                title="Hapus"
+                onClick={onDelete}
+              >
+                <Trash2 size={13} />
+              </button>
             </div>
-          </div>
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              className="icon-btn"
-              title={live ? "Stop Live" : "Live View"}
-              onClick={() => {
-                setOverride((v) => !(v ?? liveAll));
-                setFailed(false);
-                setDiag(null);
-                setLiveRetries(0);
-              }}
-            >
-              {live ? <Square size={13} /> : <Play size={13} />}
-            </button>
-            <button
-              type="button"
-              className="icon-btn"
-              title="Buka halaman kamera"
-              onClick={() =>
-                camera.web_url &&
-                window.open(camera.web_url, "_blank", "noopener")
-              }
-            >
-              <ExternalLink size={13} />
-            </button>
-            <button
-              type="button"
-              className="icon-btn"
-              title="Tes login"
-              onClick={onTest}
-            >
-              <ShieldCheck size={13} />
-            </button>
-            <button
-              type="button"
-              className="icon-btn"
-              title="Deteksi path snapshot (cari URL gambar yang cocok)"
-              onClick={onDetect}
-            >
-              <Radar size={13} />
-            </button>
-            <button
-              type="button"
-              className="icon-btn"
-              title="Kredensial"
-              onClick={onCreds}
-            >
-              <KeyRound size={13} />
-            </button>
-            <button
-              type="button"
-              className="icon-btn"
-              title="Edit"
-              onClick={onEdit}
-            >
-              <Pencil size={13} />
-            </button>
-            <button
-              type="button"
-              className="icon-btn text-bad"
-              title="Hapus"
-              onClick={onDelete}
-            >
-              <Trash2 size={13} />
-            </button>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -2166,6 +2244,196 @@ function CctvGlobalCamCredSettings({ isSuperadmin, onSaved }: { isSuperadmin: bo
         Sistem akan coba kredensial ini terlebih dahulu untuk semua kamera. Jika gagal, baru coba kredensial per-kamera. Password ini juga berlaku sebagai password masuk halaman CCTV.
       </div>
     </div>
+  );
+}
+
+function CameraPreviewModal({
+  camera,
+  liveAll,
+  onClose,
+  onTest,
+  onDetect,
+  onCreds,
+  onEdit,
+  onDelete,
+}: {
+  camera: Camera;
+  liveAll: boolean;
+  onClose: () => void;
+  onTest: () => void;
+  onDetect: () => void;
+  onCreds: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const [localLiveAll, setLocalLiveAll] = useState(liveAll);
+  const [override, setOverride] = useState<boolean | null>(null);
+  const live = override ?? localLiveAll;
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [diag, setDiag] = useState<{ reason: string; message: string; retry_in?: number } | null>(null);
+
+  const liveSrc = useMemo(() => {
+    if (!live) return undefined;
+    const base = mediaUrl(`/cameras/${camera.id}/stream`, "cctv");
+    const sep = base.includes("?") ? "&" : "?";
+    return `${base}${sep}_r=0`;
+  }, [camera.id, live]);
+
+  const snapSrc = "/cameras/" + camera.id + "/snapshot";
+  const src = live ? liveSrc : snapSrc;
+
+  useEffect(() => {
+    if (!liveLoading) return;
+    const timer = setTimeout(() => {
+      setLiveLoading(false);
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [liveLoading]);
+
+  return (
+    <ModalShell title={`${camera.name || camera.ip} - Preview`} onClose={onClose} wide>
+      <div className="flex flex-col gap-4">
+        <div className="relative aspect-video w-full bg-black/60 rounded-card border border-line overflow-hidden">
+          {camera.status === "ONLINE" && src && !failed ? (
+            <img
+              key={`${camera.id}-${live ? "live" : "snap"}-0`}
+              src={src}
+              alt={camera.name || camera.ip}
+              className="h-full w-full object-cover"
+              onLoad={() => { setLiveLoading(false); }}
+              onError={() => {
+                setFailed(true);
+                setLiveLoading(false);
+              }}
+            />
+          ) : null}
+          { !src && live && camera.status === "ONLINE" && !failed ? (
+            <div className="absolute inset-0 grid place-items-center bg-black/40 text-center text-[11px] text-muted2">
+              <div>Live view (click to start)</div>
+            </div>
+          ) : null}
+          { !src && !live && camera.status === "ONLINE" && !failed ? (
+            <div className="absolute inset-0 grid place-items-center bg-black/40 text-center text-[11px] text-muted2">
+              <div>Snapshot (menunggu tile terlihat…)</div>
+            </div>
+          ) : null}
+          {liveLoading && live && !failed ? (
+            <div className="absolute inset-0 grid place-items-center bg-black/40 text-center text-[11px] text-muted2">
+              <div>Memuat live...</div>
+            </div>
+          ) : null}
+          {camera.status !== "ONLINE" || failed ? (
+            <div className="absolute inset-0 grid place-items-center bg-black/60 text-center text-[11px] text-muted2">
+              <div className="flex flex-col items-center gap-1.5 px-3">
+                <Cctv size={22} className="mx-auto mb-1 opacity-50" />
+                <div>
+                  {camera.status !== "ONLINE"
+                    ? "Tidak terhubung (cek jaringan/IP)"
+                    : diag?.message
+                      ? `${diag.message}${diag.reason === "locked" && diag.retry_in ? ` (tunggu ±${diag.retry_in} dtk)` : ""}`
+                      : live
+                        ? "Password global tidak cocok — isi kredensial kamera ini secara manual"
+                        : "Snapshot gagal — isi kredensial kamera ini secara manual"}
+                </div>
+              </div>
+            </div>
+          ) : null}
+          <div className="absolute left-2 top-2 flex items-center gap-1.5">
+            <StatusBadge status={camera.status} />
+            {camera.status === "ONLINE" && !failed ? (
+              <span
+                className={`rounded px-1.5 py-0.5 text-[9px] font-semibold tracking-wider ${
+                  live
+                    ? "bg-red-500/90 text-white animate-pulse shadow"
+                    : "bg-black/60 text-[#5ea5ff] border border-[#5ea5ff]/40"
+                }`}
+              >
+                {live ? "● LIVE" : "GRID"}
+              </span>
+            ) : null}
+          </div>
+          <div className="absolute bottom-2 left-2 flex items-center gap-2">
+            <button
+              type="button"
+              className={`btn ${live ? "btn-danger" : "btn-primary"} py-1 text-[10px]`}
+              onClick={() => setOverride((v) => !(v ?? liveAll))}
+            >
+              {live ? "Stop Live" : "Live View"}
+            </button>
+          </div>
+        </div>
+        <div className="p-3 border-t border-line bg-panel2 rounded-b-card">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <div className="text-[11px] font-semibold text-muted">{camera.name || camera.ip}</div>
+              <div className="text-[10px] text-muted2 font-mono">{camera.ip}</div>
+            </div>
+            <div className="flex items-center gap-1 flex-wrap">
+              <button
+                type="button"
+                className={`icon-btn ${live ? "text-red-500" : "text-[#5ea5ff]"}`}
+                title={live ? "Stop Live" : "Live View"}
+                onClick={() => setOverride((v) => !(v ?? liveAll))}
+              >
+                {live ? <Square size={14} /> : <Play size={14} />}
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Buka halaman kamera"
+                onClick={() =>
+                  camera.web_url &&
+                  window.open(camera.web_url, "_blank", "noopener")
+                }
+              >
+                <ExternalLink size={14} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Tes login"
+                onClick={() => { onTest(); onClose(); }}
+              >
+                <ShieldCheck size={14} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Deteksi path snapshot"
+                onClick={() => { onDetect(); onClose(); }}
+              >
+                <Radar size={14} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Kredensial"
+                onClick={() => { onCreds(); onClose(); }}
+              >
+                <KeyRound size={14} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Edit"
+                onClick={() => { onEdit(); onClose(); }}
+              >
+                <Pencil size={14} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn text-bad"
+                title="Hapus"
+                onClick={() => { onDelete(); onClose(); }}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </ModalShell>
   );
 }
 

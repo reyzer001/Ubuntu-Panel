@@ -24,7 +24,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9\s\-]{5,19}$")
 VALID_ROLES = ("superadmin", "admin", "viewer")
 # halaman yang bisa di-grant per user (non-superadmin)
-VALID_PAGES = ("cctv",)
+VALID_PAGES = ("cctv", "report")
 
 
 class CreateUserBody(BaseModel):

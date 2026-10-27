@@ -57,6 +57,7 @@ export function useMetricsStream() {
             ram: data.ram,
             rx: data.net_rx_rate,
             tx: data.net_tx_rate,
+            temp: data.cpu_temperature ?? null,
           },
         ].slice(-MAX_POINTS)
       );

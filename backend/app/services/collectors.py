@@ -28,6 +28,16 @@ _iface_last: dict[str, dict] = {}
 _iface_last_ts: float = 0.0
 # seberapa lama cache dianggap segar (detik); WS menick tiap 2 detik
 _IFACE_CACHE_TTL = 30.0
+# cache sensor suhu agar pembacaan sysfs tidak tiap tick WS
+_thermal_lock = threading.Lock()
+_thermal_cache: dict = {"ts": 0.0, "data": []}
+_THERMAL_CACHE_TTL = 5.0
+_CPU_TEMP_PRIMARY_RE = re.compile(
+    r"package|tctl|tdie|physical id|cpu", re.IGNORECASE
+)
+_CPU_TEMP_CHIP_RE = re.compile(
+    r"coretemp|k10temp|zenpower|x86_pkg_temp", re.IGNORECASE
+)
 
 
 def _iface_rates() -> list[dict]:
@@ -87,10 +97,115 @@ def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
     )
 
 
+def _collect_thermal_sensors() -> list[dict]:
+    """Baca sensor suhu dari psutil, fallback ke thermal zone sysfs."""
+    sensors: list[dict] = []
+    try:
+        raw = psutil.sensors_temperatures()
+    except Exception:
+        raw = {}
+
+    for chip, entries in raw.items():
+        for entry in entries:
+            current = getattr(entry, "current", None)
+            if current is None:
+                continue
+            try:
+                current = float(current)
+            except (TypeError, ValueError):
+                continue
+            high = getattr(entry, "high", None)
+            critical = getattr(entry, "critical", None)
+            sensors.append(
+                {
+                    "chip": chip,
+                    "label": getattr(entry, "label", "") or chip,
+                    "current": round(current, 1),
+                    "high": round(float(high), 1) if high is not None else None,
+                    "critical": round(float(critical), 1)
+                    if critical is not None
+                    else None,
+                }
+            )
+
+    if not sensors:
+        try:
+            base = Path("/sys/class/thermal")
+            for zone in sorted(base.glob("thermal_zone*")):
+                try:
+                    label = (zone / "type").read_text().strip() or zone.name
+                    raw_temp = (zone / "temp").read_text().strip()
+                    current = float(raw_temp) / 1000.0
+                except (OSError, ValueError):
+                    continue
+                high = None
+                critical = None
+                for trip, key in (("trip_point_0_temp", "high"), ("trip_point_1_temp", "critical")):
+                    try:
+                        value = float((zone / trip).read_text().strip()) / 1000.0
+                    except (OSError, ValueError):
+                        continue
+                    if key == "high":
+                        high = round(value, 1)
+                    else:
+                        critical = round(value, 1)
+                sensors.append(
+                    {
+                        "chip": "thermal_zone",
+                        "label": label,
+                        "current": round(current, 1),
+                        "high": high,
+                        "critical": critical,
+                    }
+                )
+        except OSError:
+            pass
+
+    return sensors
+
+
+def get_thermal_sensors() -> list[dict]:
+    """Snapshot sensor suhu dengan cache pendek (WS berdetak tiap 2 detik)."""
+    now = time.time()
+    with _thermal_lock:
+        if _thermal_cache["data"] and (now - _thermal_cache["ts"]) < _THERMAL_CACHE_TTL:
+            return [dict(item) for item in _thermal_cache["data"]]
+    data = _collect_thermal_sensors()
+    with _thermal_lock:
+        _thermal_cache["ts"] = now
+        _thermal_cache["data"] = data
+    return [dict(item) for item in data]
+
+
+def pick_cpu_temperature(sensors: list[dict]) -> float | None:
+    """Pilih suhu CPU package dari daftar sensor (package/Tctl/Tdie)."""
+    if not sensors:
+        return None
+
+    def rank(sensor: dict) -> tuple[int, float]:
+        label = str(sensor.get("label") or "")
+        chip = str(sensor.get("chip") or "")
+        if _CPU_TEMP_PRIMARY_RE.search(label):
+            return (0, -float(sensor.get("current") or 0))
+        if _CPU_TEMP_CHIP_RE.search(chip):
+            return (1, -float(sensor.get("current") or 0))
+        return (2, -float(sensor.get("current") or 0))
+
+    candidates = [s for s in sensors if s.get("current") is not None]
+    if not candidates:
+        return None
+    best = sorted(candidates, key=rank)[0]
+    try:
+        return round(float(best["current"]), 1)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------- metrics
 
 def get_metrics() -> dict:
     cpu = psutil.cpu_percent(interval=None)
+    cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     load1, load5, load15 = os.getloadavg()
@@ -130,10 +245,12 @@ def get_metrics() -> dict:
             pass
 
     procs = psutil.pids()
+    temperatures = get_thermal_sensors()
 
     return {
         "time": datetime.now().isoformat(timespec="seconds"),
         "cpu": cpu,
+        "cpu_per_core": [round(float(v), 1) for v in cpu_per_core],
         "cpu_kernel": round(cpu_kernel, 4),
         "cpu_cores": psutil.cpu_count(logical=True) or 1,
         "ram": mem.percent,
@@ -155,6 +272,8 @@ def get_metrics() -> dict:
         "net_tx_rate": tx_rate,
         "disk_read_rate": read_rate,
         "disk_write_rate": write_rate,
+        "cpu_temperature": pick_cpu_temperature(temperatures),
+        "temperatures": temperatures,
         "net_interfaces": _iface_rates(),
     }
 

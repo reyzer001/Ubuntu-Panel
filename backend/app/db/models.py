@@ -1,6 +1,14 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -227,6 +235,9 @@ class ManagedComputer(Base):
     download_mbps: Mapped[float | None] = mapped_column(nullable=True)
     upload_mbps: Mapped[float | None] = mapped_column(nullable=True)
     speed_test_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # akumulasi byte jaringan sejak sampel metrik terakhir disimpan
+    net_rx_pending: Mapped[float] = mapped_column(default=0.0)
+    net_tx_pending: Mapped[float] = mapped_column(default=0.0)
     agent_version: Mapped[str] = mapped_column(String(32), default="")
     # mode autostart Windows: task-scheduler (boot, semua user) |
     # hkcu-run (login-only) | system (non-Windows)
@@ -473,3 +484,129 @@ class WebService(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow
     )
+
+
+class MetricSample(Base):
+    __tablename__ = "metric_samples"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True
+    )
+    cpu: Mapped[float] = mapped_column(default=0.0)
+    ram: Mapped[float] = mapped_column(default=0.0)
+    disk: Mapped[float] = mapped_column(default=0.0)
+    load1: Mapped[float] = mapped_column(default=0.0)
+    net_rx_rate: Mapped[float] = mapped_column(default=0.0)
+    net_tx_rate: Mapped[float] = mapped_column(default=0.0)
+    temp: Mapped[float | None] = mapped_column(nullable=True)
+
+
+class CameraEvent(Base):
+    __tablename__ = "camera_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    camera_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    ip: Mapped[str] = mapped_column(String(45), default="")
+    name: Mapped[str] = mapped_column(String(128), default="")
+    event: Mapped[str] = mapped_column(String(16))
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True
+    )
+
+
+class ComputerMetricSample(Base):
+    """Sampel CPU/RAM/trafik mentah dari heartbeat agent (sementara)."""
+
+    __tablename__ = "computer_metric_samples"
+    __table_args__ = (
+        Index(
+            "ix_computer_metric_samples_computer_ts",
+            "computer_id",
+            "timestamp",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    computer_id: Mapped[int] = mapped_column(
+        ForeignKey("managed_computers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    cpu: Mapped[float] = mapped_column(default=0.0)
+    mem: Mapped[float] = mapped_column(default=0.0)
+    net_rx_bytes: Mapped[float] = mapped_column(default=0.0)
+    net_tx_bytes: Mapped[float] = mapped_column(default=0.0)
+    net_seconds: Mapped[float] = mapped_column(default=0.0)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True
+    )
+
+
+class ComputerMetricHourly(Base):
+    """Rekap per jam CPU/RAM/trafik komputer; pengganti sampel mentah."""
+
+    __tablename__ = "computer_metric_hourly"
+    __table_args__ = (
+        UniqueConstraint(
+            "computer_id",
+            "bucket",
+            name="uq_computer_metric_hourly_computer_bucket",
+        ),
+        Index("ix_computer_metric_hourly_bucket", "bucket"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    computer_id: Mapped[int] = mapped_column(
+        ForeignKey("managed_computers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    bucket: Mapped[datetime] = mapped_column(DateTime)
+    cpu_avg: Mapped[float] = mapped_column(default=0.0)
+    cpu_min: Mapped[float] = mapped_column(default=0.0)
+    cpu_max: Mapped[float] = mapped_column(default=0.0)
+    mem_avg: Mapped[float] = mapped_column(default=0.0)
+    mem_min: Mapped[float] = mapped_column(default=0.0)
+    mem_max: Mapped[float] = mapped_column(default=0.0)
+    net_rx_bytes: Mapped[float] = mapped_column(default=0.0)
+    net_tx_bytes: Mapped[float] = mapped_column(default=0.0)
+    net_seconds: Mapped[float] = mapped_column(default=0.0)
+    samples: Mapped[int] = mapped_column(default=0)
+
+
+class ComputerSpeedSample(Base):
+    """Hasil speed test agent untuk laporan internet.
+
+    ``source`` membedakan tes PC -> internet publik (dipakai report) dari
+    tes lama PC -> server panel. Data lama tetap disimpan, tetapi tidak
+    dihitung sebagai kecepatan internet.
+    """
+
+    __tablename__ = "computer_speed_samples"
+    __table_args__ = (
+        UniqueConstraint(
+            "computer_id",
+            "tested_at",
+            name="uq_computer_speed_samples_computer_tested",
+        ),
+        Index(
+            "ix_computer_speed_samples_computer_received",
+            "computer_id",
+            "received_at",
+        ),
+        Index("ix_computer_speed_samples_received_at", "received_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    computer_id: Mapped[int] = mapped_column(
+        ForeignKey("managed_computers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    # Waktu tes menurut agent (dipakai untuk dedup heartbeat berulang).
+    tested_at: Mapped[datetime] = mapped_column(DateTime)
+    # Waktu server menerima hasil tes (dipakai untuk filter periode report).
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+    download_mbps: Mapped[float] = mapped_column(default=0.0)
+    upload_mbps: Mapped[float] = mapped_column(default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="server")

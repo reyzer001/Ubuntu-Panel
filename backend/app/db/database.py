@@ -8,6 +8,17 @@ settings = get_settings()
 connect_args = {}
 if settings.database_url.startswith("sqlite"):
     connect_args = {"check_same_thread": False, "timeout": 30}
+else:
+    # ALTER TABLE saat startup butuh AccessExclusiveLock. Tanpa batas waktu,
+    # satu transaksi lama yang menahan lock bisa membuat lifespan FastAPI
+    # menggantung selamanya (uvicorn tidak pernah bind port). Batasi juga
+    # transaksi idle agar sesi nyasar tidak menahan lock berjam-jam.
+    connect_args = {
+        "options": (
+            "-c lock_timeout=10000 "
+            "-c idle_in_transaction_session_timeout=120000"
+        )
+    }
 
 # Pool default SQLAlchemy (size 5 + overflow 10) cepat habis: heartbeat tiap
 # 10 dtk dari puluhan agent + apmon + scheduler topologi + cek manual user

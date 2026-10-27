@@ -9,6 +9,7 @@ import {
   Cctv,
   Container,
   DatabaseBackup,
+  FileText,
   Globe,
   HardDrive,
   LayoutDashboard,
@@ -23,16 +24,29 @@ import {
   Users,
   Wifi,
   Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { PageAccessUser, SystemInfo } from "@/lib/types";
 import { useAuth } from "@/store/auth";
 import clsx from "clsx";
 
-const NAV = [
+type PageAccess = "cctv" | "report";
+
+type NavItem = {
+  href: string;
+  label: string;
+  icon: LucideIcon;
+  access?: PageAccess;
+};
+
+const NAV: { section: string; items: NavItem[] }[] = [
   {
     section: "Overview",
-    items: [{ href: "/dashboard", label: "Dashboard", icon: LayoutDashboard }],
+    items: [
+      { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+      { href: "/report", label: "Reports", icon: FileText, access: "report" },
+    ],
   },
   {
     section: "System",
@@ -40,6 +54,7 @@ const NAV = [
       { href: "/services", label: "Services", icon: Layers },
       { href: "/processes", label: "Processes", icon: Activity },
       { href: "/logs", label: "Logs", icon: ScrollText },
+      { href: "/terminal", label: "Terminal", icon: SquareTerminal },
     ],
   },
   {
@@ -48,16 +63,16 @@ const NAV = [
       { href: "/storage", label: "Storage", icon: HardDrive },
       { href: "/network", label: "Network", icon: Network },
       { href: "/access-points", label: "Access Points", icon: Wifi },
-      { href: "/websites", label: "Management Website", icon: Globe },
-      { href: "/docker", label: "Management Docker", icon: Container },
+      { href: "/websites", label: "Websites", icon: Globe },
+      { href: "/docker", label: "Docker", icon: Container },
+      { href: "/cctv", label: "CCTV", icon: Cctv, access: "cctv" },
     ],
   },
   {
     section: "Security",
     items: [
       { href: "/firewall", label: "Firewall", icon: Shield },
-      { href: "/users", label: "Users", icon: Users },
-      { href: "/terminal", label: "Terminal", icon: SquareTerminal },
+      { href: "/users", label: "OS Users", icon: Users },
     ],
   },
   {
@@ -65,6 +80,17 @@ const NAV = [
     items: [
       { href: "/backup", label: "Backup", icon: DatabaseBackup },
       { href: "/maintenance", label: "Maintenance", icon: Wrench },
+    ],
+  },
+  {
+    section: "Management",
+    items: [
+      {
+        href: "/computer-management",
+        label: "Computers",
+        icon: MonitorSmartphone,
+      },
+      { href: "/user-management", label: "Panel Users", icon: UserCog },
     ],
   },
 ];
@@ -86,24 +112,17 @@ export function Sidebar() {
     staleTime: 60_000,
   });
 
-  const hasCctv =
-    me?.role === "superadmin" || (me?.page_access ?? []).includes("cctv");
+  const nav = useMemo(() => {
+    const allowed = (access?: PageAccess) =>
+      !access ||
+      me?.role === "superadmin" ||
+      (me?.page_access ?? []).includes(access);
 
-  const nav = useMemo(
-    () =>
-      NAV.map((group) =>
-        group.section === "Infrastructure" && hasCctv
-          ? {
-              ...group,
-              items: [
-                ...group.items,
-                { href: "/cctv", label: "Management CCTV", icon: Cctv },
-              ],
-            }
-          : group
-      ),
-    [hasCctv]
-  );
+    return NAV.map((group) => ({
+      ...group,
+      items: group.items.filter((item) => allowed(item.access)),
+    })).filter((group) => group.items.length > 0);
+  }, [me]);
 
   return (
     <aside className="fixed bottom-0 left-0 top-0 z-50 w-[70px] overflow-y-auto border-r border-line bg-sidebar p-3 lg:w-[250px] lg:p-5">
@@ -156,28 +175,6 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <Link
-        href="/computer-management"
-        className={clsx("nav-item justify-center lg:justify-start", {
-          active: pathname === "/computer-management",
-        })}
-        title="Management Computer"
-      >
-        <MonitorSmartphone size={17} strokeWidth={2} />
-        <span className="hidden lg:inline">Management Computer</span>
-      </Link>
-
-      <Link
-        href="/user-management"
-        className={clsx("nav-item mt-6 justify-center lg:justify-start", {
-          active: pathname === "/user-management",
-        })}
-        title="User Management"
-      >
-        <UserCog size={17} strokeWidth={2} />
-        <span className="hidden lg:inline">User Management</span>
-      </Link>
-
       <button
         onClick={async () => {
           try {
@@ -188,7 +185,7 @@ export function Sidebar() {
           logout();
           window.location.href = "/login";
         }}
-        className="nav-item justify-center lg:justify-start"
+        className="nav-item mt-6 justify-center lg:justify-start"
         title={`Logout ${user?.username ?? ""}`}
       >
         <LogOut size={17} />

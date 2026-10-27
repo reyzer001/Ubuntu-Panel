@@ -397,7 +397,7 @@ Semua action penting dicatat ke `audit_logs`:
 | Cron Job Management | PLAN | UI untuk manage crontab user |
 | Monitoring & Alerting | PLAN | Rule-based alert (CPU > 90%, RAM > 90%, dll) + notifikasi (Telegram/Discord/webhook) |
 | Security Dashboard | PLAN | Failed SSH, suspicious IP, Fail2Ban status |
-| Scheduled/Email Reports | PLAN | Laporan berkala via email |
+| Scheduled/Email Reports | DONE | Report server, top 5 beban komputer, CCTV, export PDF/CSV, email terjadwal via cron |
 
 ---
 

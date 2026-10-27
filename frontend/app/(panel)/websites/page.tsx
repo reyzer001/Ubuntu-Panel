@@ -518,7 +518,7 @@ export default function WebsitesPage() {
   return (
     <>
       <PageHeader
-        title="Menagement Website"
+        title="Websites"
         subtitle="Run & expose localhost projects — pick folder, enter command, go online with Cloudflare Tunnel"
         onRefresh={invalidate}
         refreshing={appsQuery.isLoading}

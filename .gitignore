@@ -10,5 +10,12 @@ backend/ubuntu-panel.db*
 backend/.env
 
 .run/
+backend/data/myzrok.pid
+backend/data/myzrok.log
+backend/data/weblogs/
+backend/data/deploys/
+backend/data/pgdata/
+frontend/.next.bak/
+report.md
 __pycache__/
 *.pyc

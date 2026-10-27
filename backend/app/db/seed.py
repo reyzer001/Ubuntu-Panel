@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
@@ -5,6 +7,8 @@ from ..core.config import get_settings
 from ..core.security import hash_password
 from .database import Base, engine, SessionLocal
 from .models import User
+
+log = logging.getLogger(__name__)
 
 
 def _add_column_if_missing(table_name: str, column_name: str, ddl: str) -> None:
@@ -58,19 +62,36 @@ def _migrate_computer_columns() -> None:
 def _widen_pending_cmd() -> None:
     """DB lama menyimpan pending_cmd di VARCHAR(16) — perlebar agar perintah
     seperti 'install:notepad-plus-plus' atau 'share-printer:<key>' tidak terpotong."""
+    if str(engine.url).startswith("sqlite"):
+        return  # SQLite mengabaikan panjang VARCHAR — tidak perlu ALTER
     inspector = inspect(engine)
     if not inspector.has_table("managed_computers"):
         return
     try:
+        column = next(
+            (
+                col
+                for col in inspector.get_columns("managed_computers")
+                if col["name"] == "pending_cmd"
+            ),
+            None,
+        )
+    except Exception:
+        column = None
+    if column is None:
+        return
+    length = getattr(column["type"], "length", None)
+    if length is not None and length >= 200:
+        return  # sudah lebar — jangan ambil AccessExclusiveLock saat startup
+    try:
         with engine.begin() as conn:
-            if str(engine.url).startswith("sqlite"):
-                return  # SQLite mengabaikan panjang VARCHAR — tidak perlu ALTER
+            conn.execute(text("SET LOCAL lock_timeout = '5s'"))
             conn.execute(
                 text("ALTER TABLE managed_computers "
                      "ALTER COLUMN pending_cmd TYPE VARCHAR(200)")
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("widen pending_cmd dilewati: %s", exc)
 
 
 def _migrate_web_app_columns() -> None:
@@ -91,9 +112,17 @@ def _migrate_web_app_columns() -> None:
 
 def run_seed() -> None:
     Base.metadata.create_all(bind=engine)
-    _migrate_user_columns()
-    _migrate_computer_columns()
-    _migrate_web_app_columns()
+    for migrate in (
+        _migrate_user_columns,
+        _migrate_computer_columns,
+        _migrate_web_app_columns,
+    ):
+        try:
+            migrate()
+        except Exception as exc:
+            # Migrasi best-effort: jangan sampai satu lock timeout membuat
+            # backend tidak pernah selesai startup.
+            log.warning("migrasi %s dilewati: %s", migrate.__name__, exc)
     db: Session = SessionLocal()
     try:
         if db.query(User).count() == 0:
